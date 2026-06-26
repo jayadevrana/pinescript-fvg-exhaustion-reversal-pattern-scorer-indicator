@@ -1,0 +1,347 @@
+//@version=6
+
+// =====================================================================
+// EXHAUSTION REVERSAL PATTERN SCORER  —  PHASE 1  (Pine Script v6)
+// =====================================================================
+// PURPOSE
+//   A DISCRETIONARY DAY-TRADING SCANNER / SCORING TOOL for U.S. large-cap
+//   intraday charts. It recognises a custom short-side "exhaustion after a
+//   rally" pattern, scores the confluence from 0..10, prints the score plus
+//   which conditions are satisfied, and fires TradingView alerts
+//   (WATCH >= 5, READY >= 8).
+//
+//   IT DOES NOT generate Buy/Sell signals, does NOT place trades, and does
+//   NOT connect to any broker. Every trading decision stays MANUAL. Its only
+//   job is to reduce a 50-80 name watchlist down to the highest-quality
+//   charts worth reviewing by eye.
+//
+// PRIMARY TIMEFRAME: 5-minute. Also valid on 1-minute and 15-minute.
+//
+// SCORING (max 10):
+//   1. Strong Long Tail .......... 3 pts  upper-rejection wick after a strong up-move
+//   2. Fair Value Gap (bullish) .. 2 pts  ICT 3-bar imbalance near the start of the move
+//   3. HH2 vs HH1 ................ 2 pts  later swing high <= earlier swing high (exhaustion)
+//   4. Support / Trendline Break . 2 pts  break of swing-low support or a rising trendline
+//   5. Volume Expansion .......... 1 pt   expanded SELLING volume on the breakdown
+//
+// EVALUATION MODEL
+//   The score is a snapshot of how many components are currently "present"
+//   inside a rolling pattern window (winBars). Pivots / FVGs / breaks confirm
+//   on CLOSED bars only (no intrabar repaint when "confirmed only" is ON), and
+//   alerts fire on barstate.isconfirmed.
+//
+// ASSUMPTIONS TO CONFIRM WITH CLIENT (called out, never hidden):
+//   * HH1 / HH2 are defined here as the two most recent CONFIRMED swing-high
+//     pivots (ta.pivothigh(hhLeft, hhRight)). HH1 = the EARLIER pivot, HH2 =
+//     the LATER pivot. "Met" = HH2 <= HH1: lower high = Preferred,
+//     equal-within-tolerance = Acceptable, higher = Reject. The left/right
+//     pivot strengths are inputs so the definition can be tuned once you
+//     confirm your exact HH1/HH2 rule (this is the part you flagged for
+//     discussion before development).
+//   * "Support break" = close crossing under the most recent confirmed
+//     swing-low. "Trendline break" = close under the rising line drawn through
+//     the last two confirmed swing-lows.
+//
+// OUT OF SCOPE for Phase 1 (planned future work, not included here):
+//   TradingView webhooks, Claude AI ranking, multi-symbol auto-screening,
+//   Telegram / email notifications.
+// =====================================================================
+indicator(title           = "Exhaustion Reversal Pattern Scorer",
+          shorttitle       = "Exh Scorer",
+          overlay          = true,
+          max_boxes_count  = 100,
+          max_lines_count  = 100,
+          max_labels_count = 100)
+
+// ---------------------------------------------------------------------
+// 1. INPUTS
+// ---------------------------------------------------------------------
+grpGen = "General"
+winBars     = input.int(30, "Pattern window (bars)", minval = 5, maxval = 200, group = grpGen,
+     tooltip = "How many recent bars a component may appear in and still count toward the score. ~30 bars = 2.5h on a 5m chart.")
+watchLvl    = input.int(5, "WATCH score threshold", minval = 1, maxval = 10, group = grpGen)
+readyLvl    = input.int(8, "READY score threshold", minval = 1, maxval = 10, group = grpGen)
+confirmOnly = input.bool(true, "Evaluate on confirmed (closed) bars only", group = grpGen,
+     tooltip = "ON (recommended) = stable, closing-bar-only score with no intrabar repaint. OFF = the score and alerts can update and re-fire mid-bar as price ticks - faster but volatile.")
+enforceSeq  = input.bool(false, "Enforce pattern sequencing", group = grpGen,
+     tooltip = "OFF (default) = the 5 conditions are scored as independent confluence. ON = require the narrative order: the FVG forms during the rally (at/before the long tail) and the structure break occurs AFTER the long-tail exhaustion. Turn ON for a stricter, more literal match of the written spec.")
+
+grpTail = "1 - Long Tail (3 pts)"
+useTail       = input.bool(true,  "Enable Long-Tail detection", group = grpTail)
+wickBodyMult  = input.float(1.5,  "Upper wick >= x body", minval = 0.1, step = 0.1, group = grpTail,
+     tooltip = "Upper wick must be at least this multiple of the candle body.")
+wickRangeFrac = input.float(0.5,  "Upper wick >= fraction of range", minval = 0.1, maxval = 0.95, step = 0.05, group = grpTail,
+     tooltip = "Upper wick must be at least this fraction of the full candle range (high-low).")
+runLen        = input.int(10,     "Up-move lookback (bars)", minval = 2, group = grpTail,
+     tooltip = "Window used to confirm a strong upward move preceded the rejection wick.")
+runMinPct     = input.float(1.0,  "Minimum up-move %", minval = 0.0, step = 0.1, group = grpTail,
+     tooltip = "Minimum % advance over the lookback for the prior move to count as 'strong'.")
+
+grpFvg = "2 - Fair Value Gap (2 pts)"
+useFvg    = input.bool(true,  "Enable bullish FVG detection", group = grpFvg)
+fvgMinPct = input.float(0.05, "Minimum gap size %", minval = 0.0, step = 0.01, group = grpFvg,
+     tooltip = "Minimum size of the imbalance (as % of price) for a valid FVG.")
+showFvg   = input.bool(true,  "Draw most-recent FVG box", group = grpFvg)
+
+grpHH = "3 - HH2 vs HH1 (2 pts)"
+useHH      = input.bool(true,  "Enable HH2-vs-HH1 check", group = grpHH)
+hhLeft     = input.int(5,      "Swing-high left bars", minval = 1, group = grpHH,
+     tooltip = "Pivot strength to the LEFT for a confirmed swing high.")
+hhRight    = input.int(5,      "Swing-high right bars", minval = 1, group = grpHH,
+     tooltip = "Pivot strength to the RIGHT. The pivot confirms this many bars late.")
+hhEqTolPct = input.float(0.1,  "Equal tolerance %", minval = 0.0, step = 0.05, group = grpHH,
+     tooltip = "HH2 within this % of HH1 is treated as EQUAL (double-top, Acceptable).")
+
+grpBrk = "4 - Support / Trendline Break (2 pts)"
+useBreak     = input.bool(true, "Enable structure-break detection", group = grpBrk)
+useSupport   = input.bool(true, "  - Support (swing-low) break", group = grpBrk)
+useTrendline = input.bool(true, "  - Rising-trendline break", group = grpBrk)
+plLeft       = input.int(5,     "Swing-low left bars", minval = 1, group = grpBrk)
+plRight      = input.int(5,     "Swing-low right bars", minval = 1, group = grpBrk)
+
+grpVol = "5 - Volume Expansion (1 pt)"
+useVol  = input.bool(true,  "Enable selling-volume expansion", group = grpVol)
+volLen  = input.int(20,     "Volume average length", minval = 1, group = grpVol)
+volMult = input.float(1.5,  "Volume > x average", minval = 1.0, step = 0.1, group = grpVol)
+
+grpDisp = "Display"
+showDash  = input.bool(true, "Show score dashboard", group = grpDisp)
+showLabel = input.bool(true, "Show score label on last bar", group = grpDisp)
+showMarks = input.bool(true, "Show component markers", group = grpDisp)
+showLevels= input.bool(true, "Show support / trendline levels", group = grpDisp)
+
+// ---------------------------------------------------------------------
+// 2. HELPERS
+// ---------------------------------------------------------------------
+f_yn(b)  => b ? "YES" : "-"
+f_col(b) => b ? color.new(color.teal, 0) : color.new(color.gray, 40)
+
+// When confirmOnly is ON, a bar only becomes "evaluable" for new events once it
+// closes. ta.* / pivots already confirm on closed bars; this mainly stops the
+// live forming bar from flipping the long-tail / break / volume events.
+evalOk = confirmOnly ? barstate.isconfirmed : true
+
+// ---------------------------------------------------------------------
+// 3. COMPONENT 1 - STRONG LONG TAIL (upper rejection after a strong up-move)
+// ---------------------------------------------------------------------
+rng       = high - low
+body      = math.abs(close - open)
+upperWick = high - math.max(open, close)
+
+// strong up-move into this bar: % advance of the high over the close runLen bars ago
+priorClose = close[runLen]
+upMovePct  = not na(priorClose) and priorClose != 0 ? (high - priorClose) / priorClose * 100 : 0.0
+strongUp   = not na(priorClose) and upMovePct >= runMinPct and close[1] > priorClose   // generally rising leg
+
+wickOk      = rng > 0 and upperWick >= wickBodyMult * body and upperWick >= wickRangeFrac * rng
+longTailBar = useTail and wickOk and strongUp and evalOk         // a long-tail bar just closed
+
+barsSinceTail = ta.barssince(longTailBar)
+tailActive    = useTail and not na(barsSinceTail) and barsSinceTail <= winBars
+
+// ---------------------------------------------------------------------
+// 4. COMPONENT 2 - BULLISH FAIR VALUE GAP (ICT 3-bar imbalance)
+// ---------------------------------------------------------------------
+// A bullish FVG forms when the current low is ABOVE the high two bars back,
+// leaving an unfilled gap spanning [high[2], low]. Bar[1] is the displacement.
+gapBot     = high[2]
+gapTop     = low
+gapSizePct = gapBot != 0 ? (gapTop - gapBot) / gapBot * 100 : 0.0
+fvgFormed  = useFvg and (gapTop > gapBot) and gapSizePct >= fvgMinPct and evalOk
+
+barsSinceFvg = ta.barssince(fvgFormed)
+fvgInWin     = useFvg and not na(barsSinceFvg) and barsSinceFvg <= winBars
+
+// most-recent FVG box (reused/deleted so we never leak objects)
+var box fvgBox = na
+if showFvg and fvgFormed
+    if not na(fvgBox)
+        box.delete(fvgBox)
+    fvgBox := box.new(left = bar_index[2], top = gapTop, right = bar_index, bottom = gapBot,
+         border_color = color.new(color.blue, 20), bgcolor = color.new(color.blue, 88))
+
+// ---------------------------------------------------------------------
+// 5. COMPONENT 3 - HH2 vs HH1 (later swing high <= earlier swing high)
+// ---------------------------------------------------------------------
+ph = ta.pivothigh(high, hhLeft, hhRight)   // confirmed hhRight bars late; na unless a pivot
+
+var float hh1 = na   // earlier (older) confirmed swing high
+var float hh2 = na   // later   (newer) confirmed swing high
+if not na(ph)
+    hh1 := hh2       // previous 'newer' becomes 'older'
+    hh2 := ph        // newest pivot becomes 'newer'
+
+hhEqTol  = na(hh1) ? na : hh1 * hhEqTolPct / 100.0
+hhLower  = not na(hh1) and not na(hh2) and hh2 < hh1 - nz(hhEqTol)               // strictly lower high (Preferred)
+hhEqual  = not na(hh1) and not na(hh2) and math.abs(hh2 - hh1) <= nz(hhEqTol)    // double top (Acceptable)
+hhActive = useHH and (hhLower or hhEqual)
+
+// ---------------------------------------------------------------------
+// 6. COMPONENT 4 - SUPPORT / TRENDLINE BREAK
+// ---------------------------------------------------------------------
+pl = ta.pivotlow(low, plLeft, plRight)
+
+var float lastPL  = na    // most recent confirmed swing low (support)
+var float prevPL  = na    // the swing low before it
+var int   lastPLx = na    // bar_index of the most recent swing low
+var int   prevPLx = na    // bar_index of the previous swing low
+var line  tlLine  = na    // the drawn rising-support trendline (one, reused)
+if not na(pl)
+    prevPL  := lastPL
+    prevPLx := lastPLx
+    lastPL  := pl
+    lastPLx := bar_index - plRight   // the pivot actually occurred plRight bars ago
+    // (re)draw the rising support trendline through the last two swing lows as a
+    // real line segment (not a per-bar plot) so it never streaks across the chart
+    if showLevels and useTrendline and not na(prevPL) and lastPLx != prevPLx
+        float drawSlope = (lastPL - prevPL) / (lastPLx - prevPLx)
+        if not na(tlLine)
+            line.delete(tlLine)
+        if drawSlope > 0
+            tlLine := line.new(prevPLx, prevPL, lastPLx, lastPL, color = color.new(color.purple, 0), width = 1, extend = extend.right)
+
+// support break = close crossing under the latest swing low
+supBreak = useSupport and not na(lastPL) and close < lastPL and close[1] >= lastPL
+
+// rising-trendline break = close under the line through the last two swing lows
+tlSlope   = (not na(prevPL) and not na(lastPL) and not na(prevPLx) and not na(lastPLx) and lastPLx != prevPLx) ? (lastPL - prevPL) / (lastPLx - prevPLx) : na
+tlNow     = not na(tlSlope) ? lastPL + tlSlope * (bar_index - lastPLx) : na
+tlNowPrev = not na(tlSlope) ? lastPL + tlSlope * (bar_index - 1 - lastPLx) : na
+tlBreak   = useTrendline and not na(tlSlope) and tlSlope > 0 and close < tlNow and close[1] >= tlNowPrev
+
+breakBar       = useBreak and (supBreak or tlBreak) and evalOk
+barsSinceBreak = ta.barssince(breakBar)
+breakInWin     = useBreak and not na(barsSinceBreak) and barsSinceBreak <= winBars
+
+// ---------------------------------------------------------------------
+// 7. COMPONENT 5 - SELLING VOLUME EXPANSION
+// ---------------------------------------------------------------------
+hasVol    = not na(volume) and volume > 0
+volMa     = ta.sma(volume, volLen)
+volExpBar = useVol and hasVol and not na(volMa) and volMa > 0 and volume > volMult * volMa and close < open and evalOk
+
+barsSinceVol = ta.barssince(volExpBar)
+volActive    = useVol and not na(barsSinceVol) and barsSinceVol <= winBars
+
+// ---------------------------------------------------------------------
+// 8. SCORE
+// ---------------------------------------------------------------------
+// Optional sequencing (enforceSeq): when ON, the FVG must sit at/before the
+// long-tail exhaustion (so it is part of the rally up), and the structure break
+// must come at/after it. When OFF (default) the five conditions are scored as
+// independent confluence. barsSince is larger further in the past, so
+// "FVG before tail" => barsSinceFvg >= barsSinceTail, "break after tail" => <=.
+fvgActive   = fvgInWin   and (not enforceSeq or (tailActive and barsSinceFvg   >= barsSinceTail))
+breakActive = breakInWin and (not enforceSeq or (tailActive and barsSinceBreak <= barsSinceTail))
+
+pTail  = tailActive  ? 3 : 0
+pFvg   = fvgActive   ? 2 : 0
+pHH    = hhActive    ? 2 : 0
+pBreak = breakActive ? 2 : 0
+pVol   = volActive   ? 1 : 0
+score  = pTail + pFvg + pHH + pBreak + pVol
+
+isWatch = score >= watchLvl
+isReady = score >= readyLvl
+
+// human-readable list of satisfied conditions (rebuilt every bar)
+condList = ""
+condList := tailActive  ? condList + "Long Tail\n"      : condList
+condList := fvgActive   ? condList + "Fair Value Gap\n" : condList
+condList := hhActive    ? condList + (hhLower ? "HH2 confirmed (HH2 < HH1)\n" : "HH2 confirmed (HH2 = HH1)\n") : condList
+condList := breakActive ? condList + "Support Break\n"  : condList
+condList := volActive   ? condList + "Volume Expansion\n" : condList
+
+// ---------------------------------------------------------------------
+// 9. ALERTS
+// ---------------------------------------------------------------------
+// NOTE: two mechanisms are provided - (a) static alertcondition() entries and
+// (b) the dynamic alert() below. Use ONE per level, or you will receive duplicate
+// notifications for the same event (see INSTALL_AND_USAGE.md, section 4).
+// (a) Static alertcondition() entries - selectable in the "Create Alert" dialog.
+//     {{ticker}} / {{interval}} are substituted by TradingView when the alert fires.
+alertcondition(isWatch, title = "WATCH - Score >= threshold",
+     message = "WATCH {{ticker}} ({{interval}}) - exhaustion pattern reached WATCH score. Open the chart to review.")
+alertcondition(isReady, title = "READY - Score >= threshold",
+     message = "READY {{ticker}} ({{interval}}) - exhaustion pattern reached READY score. High-quality setup to review.")
+
+// (b) Dynamic alert() - fires once when the score first crosses a threshold and
+//     carries the FULL detail requested: symbol, current score, conditions list.
+//     Built by string concatenation (never str.format -> avoids the brace runtime trap).
+var bool wasWatch = false
+var bool wasReady = false
+crossWatch = isWatch and not wasWatch
+crossReady = isReady and not wasReady
+canFire    = confirmOnly ? barstate.isconfirmed : true
+if canFire and (crossWatch or crossReady)
+    string tag = isReady ? "READY" : "WATCH"
+    string msg = tag + "  " + syminfo.ticker + "\nScore: " + str.tostring(score) + " out of 10\n" + condList
+    alert(msg, alert.freq_once_per_bar)
+if barstate.isconfirmed
+    wasWatch := isWatch
+    wasReady := isReady
+
+// ---------------------------------------------------------------------
+// 10. MARKERS & LEVELS
+// ---------------------------------------------------------------------
+plotshape(showMarks and longTailBar, title = "Long Tail", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny, text = "LT")
+plotshape(showMarks and fvgFormed, title = "FVG", style = shape.diamond,
+     location = location.belowbar, color = color.new(color.blue, 0), size = size.tiny)
+plotshape(showMarks and breakBar, title = "Break", style = shape.xcross,
+     location = location.belowbar, color = color.new(color.red, 0), size = size.tiny, text = "BRK")
+
+// support level (latest swing low) and the projected rising trendline
+// Support = most recent swing low, drawn as discrete circles (no connecting line).
+// The rising trendline is drawn as a line.new segment in section 6 above.
+plot(showLevels and useBreak and not na(lastPL) ? lastPL : na, title = "Support (swing low)",
+     color = color.new(color.red, 0), style = plot.style_circles, linewidth = 1)
+
+// ---------------------------------------------------------------------
+// 11. DASHBOARD
+// ---------------------------------------------------------------------
+scoreCol = score >= readyLvl ? color.new(color.green, 0) : score >= watchLvl ? color.new(color.orange, 0) : color.new(color.gray, 30)
+stateTxt = score >= readyLvl ? "READY" : score >= watchLvl ? "WATCH" : "-"
+hhTxt    = not hhActive ? "-" : hhLower ? "YES <" : "YES ="
+
+var table dash = table.new(position.top_right, 3, 7, frame_color = color.gray, border_color = color.gray, border_width = 1)
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "EXHAUSTION SCORER", text_color = color.white, text_halign = text.align_left,  bgcolor = color.new(color.black, 0))
+    table.cell(dash, 1, 0, syminfo.ticker,      text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.black, 0))
+    table.cell(dash, 2, 0, timeframe.period,    text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.black, 0))
+
+    table.cell(dash, 0, 1, "Long Tail (3)",     text_color = color.white, text_halign = text.align_left, bgcolor = color.new(color.gray, 70))
+    table.cell(dash, 1, 1, f_yn(tailActive),    text_color = color.white, text_halign = text.align_center, bgcolor = f_col(tailActive))
+    table.cell(dash, 2, 1, str.tostring(pTail), text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.gray, 70))
+
+    table.cell(dash, 0, 2, "Fair Value Gap (2)", text_color = color.white, text_halign = text.align_left, bgcolor = color.new(color.gray, 70))
+    table.cell(dash, 1, 2, f_yn(fvgActive),      text_color = color.white, text_halign = text.align_center, bgcolor = f_col(fvgActive))
+    table.cell(dash, 2, 2, str.tostring(pFvg),   text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.gray, 70))
+
+    table.cell(dash, 0, 3, "HH2 vs HH1 (2)",     text_color = color.white, text_halign = text.align_left, bgcolor = color.new(color.gray, 70))
+    table.cell(dash, 1, 3, hhTxt,                text_color = color.white, text_halign = text.align_center, bgcolor = f_col(hhActive))
+    table.cell(dash, 2, 3, str.tostring(pHH),    text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.gray, 70))
+
+    table.cell(dash, 0, 4, "Supp/TL Break (2)",  text_color = color.white, text_halign = text.align_left, bgcolor = color.new(color.gray, 70))
+    table.cell(dash, 1, 4, f_yn(breakActive),    text_color = color.white, text_halign = text.align_center, bgcolor = f_col(breakActive))
+    table.cell(dash, 2, 4, str.tostring(pBreak), text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.gray, 70))
+
+    table.cell(dash, 0, 5, "Volume Expansion (1)", text_color = color.white, text_halign = text.align_left, bgcolor = color.new(color.gray, 70))
+    table.cell(dash, 1, 5, f_yn(volActive),        text_color = color.white, text_halign = text.align_center, bgcolor = f_col(volActive))
+    table.cell(dash, 2, 5, str.tostring(pVol),     text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.gray, 70))
+
+    table.cell(dash, 0, 6, "SCORE",                          text_color = color.white, text_halign = text.align_left,  bgcolor = scoreCol)
+    table.cell(dash, 1, 6, str.tostring(score) + " / 10",    text_color = color.white, text_halign = text.align_center, bgcolor = scoreCol)
+    table.cell(dash, 2, 6, stateTxt,                         text_color = color.white, text_halign = text.align_center, bgcolor = scoreCol)
+
+// score label on the last bar
+var label scoreLbl = na
+if showLabel and barstate.islast
+    if not na(scoreLbl)
+        label.delete(scoreLbl)
+    scoreLbl := label.new(bar_index, high, "Score " + str.tostring(score) + " / 10  " + stateTxt,
+         style = label.style_label_down, color = scoreCol, textcolor = color.white, size = size.normal)
+
+// =====================================================================
+// END - Exhaustion Reversal Pattern Scorer (Phase 1)
+// =====================================================================
